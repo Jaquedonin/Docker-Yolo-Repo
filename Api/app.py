@@ -7,69 +7,61 @@ import os
 
 app = Flask(__name__)
 
-# Configuração do Kafka Producer e Consumer
-print(config.KAFKA_BROKER_URL)
+# Configuração do Kafka Producer para envio de solicitações de inferência
 producer = KafkaProducer(
     bootstrap_servers=config.KAFKA_BROKER_URL,
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
-consumer = KafkaConsumer(
-    config.INFERENCE_RESULT_TOPIC,
-    bootstrap_servers=config.KAFKA_BROKER_URL,
-    group_id=config.GROUP_ID,
-    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-    auto_offset_reset='earliest',
-    enable_auto_commit=True
-)
+# Caminho do arquivo para salvar os tempos de inferência
+TIME_LOG_FILE = '/data/shared/inference_times.txt'  # Ajuste para volume compartilhado
 
-# Armazenamento temporário para resultados de inferência
-inference_results = {}
+@app.route('/batch_inference', methods=['POST'])
+def batch_inference():
+    if 'images' not in request.files:
+        return jsonify({"error": "No images provided"}), 400
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    if 'image' not in request.files:
-        return jsonify({"error": "No image provided"}), 400
+    images = request.files.getlist('images')
+    inference_results = []
 
-    # Recebe a imagem e gera um ID de inferência único
-    image = request.files['image']
-    inference_id = str(time.time())
-    image_path = f'static/temp_images/temp_{inference_id}.jpg'
-    image.save(image_path)
+    # Envia cada imagem para o Kafka para processamento
+    for image in images:
+        inference_id = str(time.time())
+        temp_dir = 'static/temp_images'
+        
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+        
+        image_path = os.path.join(temp_dir, image.filename)
+        image.save(image_path)
 
-    # Publica a solicitação de inferência no Kafka
-    data = {
-        'inference_id': inference_id,
-        'image_path': image_path
-    }
-    producer.send(config.INFERENCE_REQUEST_TOPIC, value=data)
+        data = {
+            'inference_id': inference_id,
+            'image_path': image_path
+        }
+        producer.send(config.INFERENCE_REQUEST_TOPIC, value=data)
 
-    return jsonify({"inference_id": inference_id, "message": "Inference request sent."}), 202
+        inference_results.append({
+            "inference_id": inference_id,
+            "message": "Inference request sent."
+        })
+
+    # Garantir que todas as mensagens foram enviadas
+    producer.flush()
+
+    return jsonify({"batch_results": inference_results}), 202
 
 
-@app.route('/results/<inference_id>', methods=['GET'])
-def results(inference_id):
-    # Verifica se há um resultado disponível para o ID de inferência
-    if inference_id in inference_results:
-        result = inference_results.pop(inference_id)
-        return jsonify(result), 200
+@app.route('/inference_log', methods=['GET'])
+def get_inference_log():
+    """Endpoint para ler os tempos de inferência salvos no arquivo."""
+    if os.path.exists(TIME_LOG_FILE):
+        with open(TIME_LOG_FILE, 'r') as file:
+            times = file.readlines()
+        return jsonify({"inference_times": times}), 200
     else:
-        return jsonify({"message": "Result not available yet. Try again later."}), 202
-
-
-def listen_for_results():
-    # Listener que recebe resultados de inferência do Kafka
-    for message in consumer:
-        result = message.value
-        inference_id = result['inference_id']
-        inference_results[inference_id] = result  # Armazena o resultado na memória
+        return jsonify({"error": "Inference log file not found"}), 404
 
 
 if __name__ == '__main__':
-    from threading import Thread
-
-    # Inicia o listener para resultados de inferência
-    listener_thread = Thread(target=listen_for_results)
-    listener_thread.start()
-
     app.run(host='0.0.0.0', port=5000)

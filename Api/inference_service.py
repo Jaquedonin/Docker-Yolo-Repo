@@ -1,14 +1,23 @@
+import os
+import json
+import logging
 from kafka import KafkaProducer, KafkaConsumer
 from ultralytics import YOLO
-import json
-import config
-import os
 import torch
+import config
 
-# Configuração do dispositivo para a inferência
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Configuração do Kafka Consumer
+# Configuração de logging
+logging.basicConfig(
+    level=logging.DEBUG,  # Nível de log (DEBUG para mostrar tudo)
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/data/shared/inference_service.log'),  # Arquivo de log
+        logging.StreamHandler()  # Exibe também no terminal
+    ]
+)
+
 consumer = KafkaConsumer(
     config.INFERENCE_REQUEST_TOPIC,
     bootstrap_servers=config.KAFKA_BROKER_URL,
@@ -18,59 +27,68 @@ consumer = KafkaConsumer(
     enable_auto_commit=True
 )
 
-# Configuração do Kafka Producer
 producer = KafkaProducer(
     bootstrap_servers=config.KAFKA_BROKER_URL,
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
-# Carregar o modelo YOLO para o dispositivo disponível
 model = YOLO('models/yolov8n.pt').to(device)
 
+TIME_LOG_FILE = '/data/shared/inference_times.txt'  # Log gravado no diretório compartilhado
+
 def process_inference_request():
-    """Processa cada solicitação de inferência recebida via Kafka."""
     for message in consumer:
         data = message.value
         inference_id = data.get('inference_id')
         image_path = data.get('image_path')
 
-        # Verifica se a mensagem possui os dados necessários
         if not inference_id or not image_path:
-            print("Erro: 'inference_id' ou 'image_path' ausente na mensagem.")
+            logging.error("Erro: 'inference_id' ou 'image_path' ausente na mensagem.")
+            continue
+
+        # Verifica se a imagem existe no caminho compartilhado
+        shared_image_path = f'/data/shared/{image_path}'
+        if not os.path.exists(shared_image_path):
+            logging.error(f"Erro: A imagem {shared_image_path} não foi encontrada.")
             continue
 
         # Realiza a inferência
         try:
-            # Realiza a inferência no YOLO com a imagem recebida
-            results = model(image_path)
+            logging.info(f"Processando requisição de inferência {inference_id} para a imagem {image_path}")
+            results = model(shared_image_path)
             detections = []
-
-            # Processa os resultados, extraindo os bounding boxes e confiabilidade
             for result in results:
                 for box in result.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                     confidence = float(box.conf[0].cpu().numpy())
                     detections.append({"box": [x1, y1, x2, y2], "confidence": confidence})
 
-            # Monta o resultado com o tempo de inferência, se disponível
+            total_inference_time = (
+                results[0].speed['postprocess'] +
+                results[0].speed['preprocess'] +
+                results[0].speed['inference']
+            )
+            with open(TIME_LOG_FILE, 'a') as file:
+                file.write(f"{total_inference_time}\n")
+
             result_data = {
                 'inference_id': inference_id,
                 'detections': detections,
-                'inference_time': results[0].speed['inference'] if hasattr(results[0], 'speed') else None
+                'inference_time': total_inference_time
             }
 
-            # Envia o resultado da inferência para o Kafka
             producer.send(config.INFERENCE_RESULT_TOPIC, value=result_data)
-            producer.flush()  # Garante que a mensagem seja enviada imediatamente
+            producer.flush()
+
+            logging.info(f"Inferência {inference_id} processada com sucesso. Detections: {detections}")
 
         except Exception as e:
-            print(f"Erro ao processar {inference_id}: {str(e)}")
+            logging.error(f"Erro ao processar {inference_id}: {str(e)}")
 
         # Remove a imagem temporária após o processamento
-        if os.path.exists(image_path):
-            os.remove(image_path)
-        else:
-            print(f"O caminho da imagem {image_path} não existe.")
+        if os.path.exists(shared_image_path):
+            os.remove(shared_image_path)
+            logging.info(f"Imagem {shared_image_path} removida após o processamento.")
 
 if __name__ == '__main__':
     process_inference_request()
