@@ -8,6 +8,7 @@ import os
 app = Flask(__name__)
 
 # Configuração do Kafka Producer e Consumer
+print(config.KAFKA_BROKER_URL)
 producer = KafkaProducer(
     bootstrap_servers=config.KAFKA_BROKER_URL,
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
